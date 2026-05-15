@@ -481,7 +481,7 @@ public final class DatafeedManager {
             // TODO: invoke InternalCloudApiKeyService.revokeCloudApiKey once the revoke primitive is available
             // (tracked in beads issue elastic-workspace-3kf)
             logger.warn(
-                "[{}] Downstream operation failed after CPS key creation; skipping revocation of key [{}] — revoke primitive not yet available",
+                "[{}] Downstream operation failed after CPS key creation; skipping revocation of key [{}]",
                 datafeedId,
                 apiKeyId
             );
