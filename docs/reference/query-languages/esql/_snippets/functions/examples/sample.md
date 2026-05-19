@@ -19,11 +19,11 @@ FROM sample_data
 | SORT client_ip
 ```
 
-| sample_messages:keyword | client_ip:ip |
+| client_ip:ip | sample_messages:keyword |
 | --- | --- |
-| Disconnected | 172.21.0.5 |
-| Connected to 10.1.0.2 | 172.21.2.113 |
-| Connected to 10.1.0.3 | 172.21.2.162 |
-| [Connection error, Connected to 10.1.0.1] | 172.21.3.15 |
+| 172.21.0.5 | Disconnected |
+| 172.21.2.113 | Connected to 10.1.0.2 |
+| 172.21.2.162 | Connected to 10.1.0.3 |
+| 172.21.3.15 | [Connection error, Connected to 10.1.0.1] |
 
 
