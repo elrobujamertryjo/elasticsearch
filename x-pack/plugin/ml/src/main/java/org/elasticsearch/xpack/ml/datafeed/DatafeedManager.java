@@ -19,7 +19,6 @@ import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.core.CheckedConsumer;
 import org.elasticsearch.core.Nullable;
-import org.elasticsearch.core.Tuple;
 import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.license.RemoteClusterLicenseChecker;
 import org.elasticsearch.persistent.PersistentTasksCustomMetadata;
@@ -53,11 +52,7 @@ import org.elasticsearch.xpack.core.security.action.user.HasPrivilegesRequest;
 import org.elasticsearch.xpack.core.security.action.user.HasPrivilegesResponse;
 import org.elasticsearch.xpack.core.security.authz.RoleDescriptor;
 import org.elasticsearch.xpack.core.security.authz.permission.ResourcePrivileges;
-import org.elasticsearch.xpack.core.security.cloud.CloudCredential;
-import org.elasticsearch.xpack.core.security.cloud.CloudCredentialManager;
 import org.elasticsearch.xpack.core.security.cloud.CloudCredentialsExtension;
-import org.elasticsearch.xpack.core.security.cloud.InternalCloudApiKeyService;
-import org.elasticsearch.xpack.core.security.cloud.PersistedCloudCredential;
 import org.elasticsearch.xpack.core.security.support.Exceptions;
 import org.elasticsearch.xpack.ml.MachineLearningExtension;
 import org.elasticsearch.xpack.ml.datafeed.persistence.DatafeedConfigProvider;
@@ -97,8 +92,7 @@ public final class DatafeedManager {
     private final Client client;
     private final Settings settings;
     private final CrossProjectModeDecider crossProjectModeDecider;
-    private final MachineLearningExtension mlExtension;
-    private final AnomalyDetectionAuditor auditor;
+    private final CredentialTransitions credentialTransitions;
 
     public DatafeedManager(
         DatafeedConfigProvider datafeedConfigProvider,
@@ -115,26 +109,24 @@ public final class DatafeedManager {
         this.client = client;
         this.settings = settings;
         this.crossProjectModeDecider = new CrossProjectModeDecider(settings);
-        this.mlExtension = Objects.requireNonNull(mlExtension);
-        this.auditor = Objects.requireNonNull(auditor);
+        this.credentialTransitions = new CredentialTransitions(
+            Objects.requireNonNull(auditor),
+            Objects.requireNonNull(mlExtension).getCloudApiKeyService(),
+            mlExtension.getCloudCredentialManager(),
+            client,
+            xContentRegistry,
+            datafeedConfigProvider
+        );
     }
 
     private boolean crossProjectMlEnabled() {
         return crossProjectModeDecider.crossProjectEnabled() && CloudCredentialsExtension.ML_CROSS_PROJECT.isEnabled();
     }
 
-    private CloudCredentialManager credentialManager() {
-        return mlExtension.getCloudCredentialManager();
-    }
-
-    private InternalCloudApiKeyService apiKeyService() {
-        return mlExtension.getCloudApiKeyService();
-    }
-
     /**
      * Whether this datafeed may execute cross-project searches that require a persisted internal cloud credential.
      */
-    private static boolean datafeedNeedsCloudInternalCredential(DatafeedConfig datafeed) {
+    static boolean datafeedNeedsCloudInternalCredential(DatafeedConfig datafeed) {
         if (datafeed.getProjectRouting() != null) {
             return true;
         }
@@ -263,12 +255,9 @@ public final class DatafeedManager {
 
         Runnable doUpdate = () -> useSecondaryAuthIfAvailable(securityContext, () -> {
             final Map<String, String> headers = threadPool.getThreadContext().getHeaders();
-            final boolean hasCpsCredential = credentialManager().hasCloudManagedCredential(threadPool.getThreadContext());
+            final boolean hasCpsCredential = credentialTransitions.hasCloudManagedCredential(threadPool);
 
-            // Wrap the validator to check project_routing requires CPS environment.
-            // This validation is applied to the updated config (after the update is applied to the existing config).
             BiConsumer<DatafeedConfig, ActionListener<Boolean>> wrappedValidator = (updatedConfig, validatorListener) -> {
-                // Validate project_routing requires CPS to be enabled in the environment
                 if (updatedConfig.getProjectRouting() != null && crossProjectMlEnabled() == false) {
                     validatorListener.onFailure(
                         new ElasticsearchStatusException(
@@ -278,7 +267,6 @@ public final class DatafeedManager {
                     );
                     return;
                 }
-                // Then call the original validator
                 jobConfigProvider.validateDatafeedJob(updatedConfig, validatorListener);
             };
 
@@ -288,21 +276,25 @@ public final class DatafeedManager {
                 try {
                     final DatafeedConfig current = configBuilder.build();
                     final DatafeedConfig merged = update.apply(current, headers, state);
-                    final boolean mayRekey = crossProjectMlEnabled()
-                        && hasCpsCredential
-                        && datafeedNeedsCloudInternalCredential(merged)
-                        && (current.getCloudInternalCredential() == null || update.affectsCrossProjectSearchSurface(current));
-                    if (mayRekey) {
-                        applyCpsUpdateWithRekey(request, current.getJobId(), threadPool, securityContext, wrappedValidator, l);
-                    } else {
-                        datafeedConfigProvider.updateDatefeedConfig(
-                            datafeedId,
-                            update,
-                            headers,
-                            wrappedValidator,
-                            l.delegateFailureAndWrap((ll, updatedConfig) -> ll.onResponse(new PutDatafeedAction.Response(updatedConfig)))
-                        );
-                    }
+                    CredentialTransitions.TransitionContext ctx = new CredentialTransitions.TransitionContext(
+                        crossProjectMlEnabled(),
+                        hasCpsCredential,
+                        current.getCloudInternalCredential() != null,
+                        datafeedNeedsCloudInternalCredential(merged),
+                        update.affectsCrossProjectSearchSurface(current)
+                    );
+                    CredentialTransitions.Intent intent = CredentialTransitions.decideForUpdate(ctx);
+                    credentialTransitions.executeUpdate(
+                        intent,
+                        request,
+                        merged,
+                        current.getJobId(),
+                        headers,
+                        threadPool,
+                        securityContext,
+                        wrappedValidator,
+                        l
+                    );
                 } catch (Exception e) {
                     l.onFailure(e);
                 }
@@ -322,75 +314,6 @@ public final class DatafeedManager {
         );
     }
 
-    /**
-     * Grants a new cloud internal API key, applies the datafeed update, persists the new credential in the same write,
-     * and best-effort revokes the old key if one existed (re-key case).
-     *
-     * @implNote Synchronous credential extraction and {@code grantCloudAuthentication} run inside
-     *           {@link #mintCpsKeyForDatafeed}, which applies {@code useSecondaryAuthIfAvailable} so secondary auth is
-     *           honored. The grant callback runs asynchronously and re-enters secondary auth before persisting.
-     *           <p>
-     *           This operation is NOT idempotent. If the caller retries after the mint succeeds but before this
-     *           method's listener resolves, a second key will be granted and the first becomes orphaned. With the
-     *           revoke primitive unavailable (see TODOs in {@link #bestEffortRevokeOldKey} and {@link #revokeKeyOnFailure}),
-     *           each retry leaks one cloud API key. Tracked in beads issue elastic-workspace-rqpf.
-     */
-    private void applyCpsUpdateWithRekey(
-        UpdateDatafeedAction.Request request,
-        String jobId,
-        ThreadPool threadPool,
-        SecurityContext securityContext,
-        BiConsumer<DatafeedConfig, ActionListener<Boolean>> wrappedValidator,
-        ActionListener<PutDatafeedAction.Response> listener
-    ) {
-        String datafeedId = request.getUpdate().getId();
-        mintCpsKeyForDatafeed(datafeedId, threadPool, securityContext, listener, (newCredential, userHeaders) -> {
-            auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REKEYED));
-            ActionListener<PutDatafeedAction.Response> guardedListener = revokeKeyOnFailure(newCredential, jobId, listener);
-            datafeedConfigProvider.updateDatefeedConfig(
-                datafeedId,
-                request.getUpdate(),
-                userHeaders,
-                newCredential,
-                wrappedValidator,
-                guardedListener.delegateFailureAndWrap((l, tuple) -> finalizeRekey(datafeedId, tuple, l))
-            );
-        });
-    }
-
-    private void finalizeRekey(
-        String datafeedId,
-        Tuple<DatafeedConfig, PersistedCloudCredential> tuple,
-        ActionListener<PutDatafeedAction.Response> listener
-    ) {
-        DatafeedConfig updatedConfig = tuple.v1();
-        PersistedCloudCredential oldCredential = tuple.v2();
-        if (oldCredential != null) {
-            bestEffortRevokeOldKey(datafeedId, oldCredential, updatedConfig, listener);
-        } else {
-            listener.onResponse(new PutDatafeedAction.Response(updatedConfig));
-        }
-    }
-
-    /**
-     * Placeholder until {@code InternalCloudApiKeyService} exposes revoke; logs and completes successfully.
-     */
-    private void bestEffortRevokeOldKey(
-        String datafeedId,
-        PersistedCloudCredential oldCredential,
-        DatafeedConfig patchedConfig,
-        ActionListener<PutDatafeedAction.Response> listener
-    ) {
-        // TODO: invoke InternalCloudApiKeyService.revokeCloudApiKey once the revoke primitive is available
-        // (tracked in beads issue elastic-workspace-rqpf)
-        auditor.info(
-            patchedConfig.getJobId(),
-            Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_SKIPPED, oldCredential.id())
-        );
-        oldCredential.close();
-        listener.onResponse(new PutDatafeedAction.Response(patchedConfig));
-    }
-
     public void deleteDatafeed(DeleteDatafeedAction.Request request, ClusterState state, ActionListener<AcknowledgedResponse> listener) {
         if (getDatafeedTask(state, request.getDatafeedId()) != null) {
             listener.onFailure(
@@ -405,24 +328,10 @@ public final class DatafeedManager {
 
         datafeedConfigProvider.getDatafeedConfig(datafeedId, null, listener.delegateFailureAndWrap((delegate, datafeedConfigBuilder) -> {
             DatafeedConfig datafeedConfig = datafeedConfigBuilder.build();
-            PersistedCloudCredential cred = datafeedConfig.getCloudInternalCredential();
-            if (cred != null) {
-                // TODO: invoke InternalCloudApiKeyService.revokeCloudApiKey once the revoke primitive is available
-                // (tracked in beads issue elastic-workspace-rqpf)
-                auditor.info(
-                    datafeedConfig.getJobId(),
-                    Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_SKIPPED, cred.id())
-                );
-                cred.close();
-            }
-            JobDataDeleter jobDataDeleter = new JobDataDeleter(client, datafeedConfig.getJobId());
-            jobDataDeleter.deleteDatafeedTimingStats(
-                delegate.delegateFailureAndWrap(
-                    (l, unused1) -> datafeedConfigProvider.deleteDatafeedConfig(
-                        datafeedId,
-                        l.delegateFailureAndWrap((ll, unused2) -> ll.onResponse(AcknowledgedResponse.TRUE))
-                    )
-                )
+            credentialTransitions.revokeEnvelopeIfPresent(
+                datafeedId,
+                datafeedConfig,
+                () -> deleteDatafeedAfterRevoke(datafeedId, datafeedConfig, delegate)
             );
         }));
 
@@ -443,15 +352,16 @@ public final class DatafeedManager {
         ActionListener<PutDatafeedAction.Response> listener
     ) throws IOException {
         if (response.isCompleteMatch()) {
-            // Check if this is a CPS datafeed that needs an internal API key
-            if (crossProjectMlEnabled()
-                && credentialManager().hasCloudManagedCredential(threadPool.getThreadContext())
-                && datafeedNeedsCloudInternalCredential(request.getDatafeed())) {
-                grantCpsKeyAndPutDatafeed(request, clusterState, threadPool, securityContext, listener);
-            } else {
-                // Legacy path - no CPS or no cloud-managed credential
-                putDatafeed(request, threadPool.getThreadContext().getHeaders(), clusterState, listener);
-            }
+            boolean hasCpsCredential = credentialTransitions.hasCloudManagedCredential(threadPool);
+            CredentialTransitions.TransitionContext ctx = new CredentialTransitions.TransitionContext(
+                crossProjectMlEnabled(),
+                hasCpsCredential,
+                false,
+                datafeedNeedsCloudInternalCredential(request.getDatafeed()),
+                false
+            );
+            CredentialTransitions.Intent intent = CredentialTransitions.decideForCreate(ctx);
+            credentialTransitions.executePut(intent, request, clusterState, threadPool, securityContext, this::putDatafeed, listener);
         } else {
             XContentBuilder builder = JsonXContent.contentBuilder();
             builder.startObject();
@@ -472,84 +382,20 @@ public final class DatafeedManager {
         }
     }
 
-    /**
-     * Grants a CPS internal API key for the datafeed, updates the request with the new key and auth headers,
-     * then delegates to {@link #putDatafeed}. Used by both the security and non-security creation paths.
-     * If any downstream operation fails after the key is created, the key is revoked to prevent leaks.
-     *
-     * @param securityContext when non-null (security-enabled put path), synchronous extraction and the grant
-     *                        response callback are wrapped with
-     *                        {@link org.elasticsearch.xpack.ml.utils.SecondaryAuthorizationUtils#useSecondaryAuthIfAvailable}
-     *                        so {@link org.elasticsearch.xpack.core.security.cloud.CloudCredentialManager} sees secondary-authenticated
-     *                        headers after async privilege checks.
-     * @implNote This operation is NOT idempotent. If the caller retries after the mint succeeds but before this
-     *           method's listener resolves, a second key will be granted and the first becomes orphaned. With the
-     *           revoke primitive unavailable (see TODOs in {@link #bestEffortRevokeOldKey} and {@link #revokeKeyOnFailure}),
-     *           each retry leaks one cloud API key. Tracked in beads issue elastic-workspace-rqpf.
-     */
-    private void grantCpsKeyAndPutDatafeed(
-        PutDatafeedAction.Request request,
-        ClusterState clusterState,
-        ThreadPool threadPool,
-        @Nullable SecurityContext securityContext,
-        ActionListener<PutDatafeedAction.Response> listener
-    ) {
-        String datafeedId = request.getDatafeed().getId();
-        String jobId = request.getDatafeed().getJobId();
-        auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_MINTED));
-        mintCpsKeyForDatafeed(datafeedId, threadPool, securityContext, listener, (newCredential, userHeaders) -> {
-            DatafeedConfig.Builder builder = new DatafeedConfig.Builder(request.getDatafeed());
-            builder.setCloudInternalCredential(newCredential);
-            PutDatafeedAction.Request updatedRequest = new PutDatafeedAction.Request(builder.build());
-            updatedRequest.masterNodeTimeout(request.masterNodeTimeout());
-            putDatafeed(updatedRequest, userHeaders, clusterState, revokeKeyOnFailure(newCredential, jobId, listener));
-        });
-    }
-
-    /**
-     * Extracts the caller's cloud credential, mints an internal API key for the datafeed, then runs {@code onSuccess}
-     * under secondary auth (see {@link org.elasticsearch.xpack.ml.utils.SecondaryAuthorizationUtils#useSecondaryAuthIfAvailable}).
-     */
-    private void mintCpsKeyForDatafeed(
+    private void deleteDatafeedAfterRevoke(
         String datafeedId,
-        ThreadPool threadPool,
-        @Nullable SecurityContext securityContext,
-        ActionListener<?> failurePropagator,
-        BiConsumer<PersistedCloudCredential, Map<String, String>> onSuccess
+        DatafeedConfig datafeedConfig,
+        ActionListener<AcknowledgedResponse> delegate
     ) {
-        useSecondaryAuthIfAvailable(securityContext, () -> {
-            CloudCredential callerCredential = credentialManager().extractCloudManagedCredential(threadPool.getThreadContext());
-            Map<String, String> userHeaders = threadPool.getThreadContext().getHeaders();
-            apiKeyService().grantCloudAuthentication(
-                callerCredential,
-                "datafeed:" + datafeedId,
-                ActionListener.wrap(
-                    result -> useSecondaryAuthIfAvailable(
-                        securityContext,
-                        () -> onSuccess.accept(result.persistedCredential(), userHeaders)
-                    ),
-                    e -> {
-                        logger.error(() -> "[" + datafeedId + "] Failed to mint internal cloud API key for CPS datafeed", e);
-                        failurePropagator.onFailure(e);
-                    }
+        JobDataDeleter jobDataDeleter = new JobDataDeleter(client, datafeedConfig.getJobId());
+        jobDataDeleter.deleteDatafeedTimingStats(
+            delegate.delegateFailureAndWrap(
+                (l, unused1) -> datafeedConfigProvider.deleteDatafeedConfig(
+                    datafeedId,
+                    l.delegateFailureAndWrap((ll, unused2) -> ll.onResponse(AcknowledgedResponse.TRUE))
                 )
-            );
-        });
-    }
-
-    /**
-     * Wraps a listener to best-effort revoke a newly minted CPS API key when downstream operations fail.
-     * This prevents key leaks when operations (validation, persistence, etc.) fail after key creation.
-     * The original failure is always propagated to the delegate listener regardless of revocation outcome.
-     */
-    private <T> ActionListener<T> revokeKeyOnFailure(PersistedCloudCredential mintedCredential, String jobId, ActionListener<T> delegate) {
-        return ActionListener.wrap(delegate::onResponse, e -> {
-            // TODO: invoke InternalCloudApiKeyService.revokeCloudApiKey once the revoke primitive is available
-            // (tracked in beads issue elastic-workspace-rqpf)
-            auditor.info(jobId, Messages.getMessage(Messages.JOB_AUDIT_DATAFEED_CPS_KEY_REVOCATION_SKIPPED, mintedCredential.id()));
-            mintedCredential.close();
-            delegate.onFailure(e);
-        });
+            )
+        );
     }
 
     private void putDatafeed(
@@ -560,7 +406,6 @@ public final class DatafeedManager {
     ) {
         DatafeedConfig.validateAggregations(request.getDatafeed().getParsedAggregations(xContentRegistry));
 
-        // Validate project_routing requires CPS to be enabled in the environment.
         if (request.getDatafeed().getProjectRouting() != null && crossProjectMlEnabled() == false) {
             listener.onFailure(
                 new ElasticsearchStatusException(

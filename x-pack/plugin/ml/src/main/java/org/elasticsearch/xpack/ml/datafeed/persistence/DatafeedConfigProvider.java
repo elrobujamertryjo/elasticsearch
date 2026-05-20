@@ -62,6 +62,7 @@ import org.elasticsearch.xpack.core.ml.utils.ExceptionsHelper;
 import org.elasticsearch.xpack.core.ml.utils.MlStrings;
 import org.elasticsearch.xpack.core.ml.utils.ToXContentParams;
 import org.elasticsearch.xpack.core.security.cloud.PersistedCloudCredential;
+import org.elasticsearch.xpack.ml.datafeed.CredentialTransitions;
 
 import java.io.IOException;
 import java.util.ArrayList;
@@ -323,36 +324,34 @@ public class DatafeedConfigProvider {
             datafeedId,
             update,
             headers,
-            null,
+            CredentialTransitions.Change.KEEP,
             validator,
             updatedConfigListener.delegateFailureAndWrap((l, tuple) -> l.onResponse(tuple.v1()))
         );
     }
 
     /**
-     * Updates an existing datafeed config, optionally patching in a new cloud credential in the same write.
-     * The {@code newCredential} replaces any existing credential stored in the config; pass {@code null} to leave
-     * the existing credential unchanged.
+     * Updates an existing datafeed config, applying a {@link CredentialTransitions.Change} to the persisted cloud credential envelope.
      * <p>
-     * On success, the listener receives the persisted config and, when {@code newCredential} was non-null, the
-     * credential it replaced (for best-effort revocation); otherwise {@code null} in the second tuple position.
+     * On success, the listener receives the persisted config and, when a superseded credential was removed or replaced,
+     * that credential (for best-effort revocation); otherwise {@code null} in the second tuple position.
      */
     public void updateDatefeedConfig(
         String datafeedId,
         DatafeedUpdate update,
         Map<String, String> headers,
-        @Nullable PersistedCloudCredential newCredential,
+        CredentialTransitions.Change change,
         BiConsumer<DatafeedConfig, ActionListener<Boolean>> validator,
         ActionListener<Tuple<DatafeedConfig, PersistedCloudCredential>> updatedConfigListener
     ) {
-        updateDatefeedConfigInternal(datafeedId, update, headers, newCredential, validator, updatedConfigListener);
+        updateDatefeedConfigInternal(datafeedId, update, headers, change, validator, updatedConfigListener);
     }
 
     private void updateDatefeedConfigInternal(
         String datafeedId,
         DatafeedUpdate update,
         Map<String, String> headers,
-        @Nullable PersistedCloudCredential newCredential,
+        CredentialTransitions.Change change,
         BiConsumer<DatafeedConfig, ActionListener<Boolean>> validator,
         ActionListener<Tuple<DatafeedConfig, PersistedCloudCredential>> updatedConfigListener
     ) {
@@ -391,12 +390,20 @@ public class DatafeedConfigProvider {
 
                     final DatafeedConfig configToPersist;
                     final PersistedCloudCredential supersededCredential;
-                    if (newCredential != null) {
-                        supersededCredential = configAfterApply.getCloudInternalCredential();
-                        configToPersist = new DatafeedConfig.Builder(configAfterApply).setCloudInternalCredential(newCredential).build();
-                    } else {
-                        supersededCredential = null;
-                        configToPersist = configAfterApply;
+                    switch (change) {
+                        case CredentialTransitions.Change.Replace(PersistedCloudCredential newCredential) -> {
+                            supersededCredential = configAfterApply.getCloudInternalCredential();
+                            configToPersist = new DatafeedConfig.Builder(configAfterApply).setCloudInternalCredential(newCredential)
+                                .build();
+                        }
+                        case CredentialTransitions.Change.Clear ignored -> {
+                            supersededCredential = configAfterApply.getCloudInternalCredential();
+                            configToPersist = new DatafeedConfig.Builder(configAfterApply).setCloudInternalCredential(null).build();
+                        }
+                        case CredentialTransitions.Change.Keep ignored -> {
+                            supersededCredential = null;
+                            configToPersist = configAfterApply;
+                        }
                     }
 
                     validator.accept(
