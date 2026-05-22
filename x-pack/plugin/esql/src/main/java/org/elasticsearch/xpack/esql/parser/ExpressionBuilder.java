@@ -46,6 +46,7 @@ import org.elasticsearch.xpack.esql.expression.function.EsqlFunctionRegistry;
 import org.elasticsearch.xpack.esql.expression.function.UnresolvedFunction;
 import org.elasticsearch.xpack.esql.expression.function.aggregate.FilteredExpression;
 import org.elasticsearch.xpack.esql.expression.function.fulltext.MatchOperator;
+import org.elasticsearch.xpack.esql.expression.function.scalar.convert.ToGauge;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.regex.RLike;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.regex.RLikeList;
 import org.elasticsearch.xpack.esql.expression.function.scalar.string.regex.WildcardLike;
@@ -791,6 +792,19 @@ public abstract class ExpressionBuilder extends IdentifierBuilder {
     }
 
     private Expression castToType(Source source, ParseTree parseTree, EsqlBaseParser.DataTypeContext dataTypeCtx) {
+        // DataType.GAUGE_CAST_NAME is a virtual cast target — not a real DataType, but maps to the plain numeric
+        // variant of the input's counter type (counter_long→long, counter_double→double, counter_integer→integer).
+        if (dataTypeCtx instanceof EsqlBaseParser.ToDataTypeContext toDataType) {
+            String typeName = visitIdentifier(toDataType.identifier()).toLowerCase(Locale.ROOT);
+            if (DataType.GAUGE_CAST_NAME.equals(typeName)) {
+                Expression expr = expression(parseTree);
+                ToGauge convertFunction = new ToGauge(source, expr);
+                if (Build.current().isSnapshot() == false && EsqlFunctionRegistry.isSnapshotOnly(ToGauge.class)) {
+                    throw new ParsingException(source, "Unsupported conversion to type [{}]", DataType.GAUGE_CAST_NAME);
+                }
+                return convertFunction;
+            }
+        }
         DataType dataType = typedParsing(this, dataTypeCtx, DataType.class);
         var converterToFactory = EsqlDataTypeConverter.converterFunctionFactory(dataType);
         if (converterToFactory == null) {
