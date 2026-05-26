@@ -11401,6 +11401,27 @@ public class LogicalPlanOptimizerTests extends AbstractLogicalPlanOptimizerTests
     }
 
     /**
+     * Invariant: when LIMIT BY groups by an attribute produced by MV_EXPAND, the LIMIT BY must stay above
+     * the expand to preserve attribute liveness.
+     * Defect: pushing LIMIT BY below MV_EXPAND produced missing references.
+     * Expected: optimized plan keeps LIMIT BY directly above MV_EXPAND.
+     */
+    public void testLimitByGroupingProducedByMvExpandStaysAboveExpand() {
+        LogicalPlan plan = plan("""
+            ROW x = 1
+            | MV_EXPAND x
+            | LIMIT 1 BY x
+            """);
+        if (plan instanceof Limit implicitLimit) {
+            plan = implicitLimit.child();
+        }
+        var limitBy = as(plan, LimitBy.class);
+        assertThat(Expressions.names(limitBy.groupings()), contains("x"));
+        var mvExpand = as(limitBy.child(), MvExpand.class);
+        assertThat(mvExpand.target().name(), equalTo("x"));
+    }
+
+    /**
      * Invariant: synthetic conversion attributes introduced for UNION type resolution must survive intermediate
      * project-style operators (RENAME/KEEP/DROP) until downstream rewrites finish.
      * Defect: project-style operators dropped synthetic attributes, causing missing references in later stats.
